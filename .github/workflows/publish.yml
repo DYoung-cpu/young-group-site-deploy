@@ -1,0 +1,88 @@
+# Publishes younggroupmtg.com from DYoung-cpu/young-group-site.
+#
+# ⛔ WHY THIS LIVES IN ITS OWN REPO. The Vercel token is account-wide: it also
+# reaches the CRM. Anyone who can change the site repo can change a workflow
+# there, or make the build print what it can see — so the token cannot sit in
+# that repo or on a runner that runs the site's code. Here it is held by a
+# repo only David can push to, and this job never runs the site's code: it
+# fetches the files with a READ-ONLY deploy key and uploads them, and Vercel
+# builds them on its own machines, where the token does not exist.
+#
+# Public so the 5-minute poll costs no Actions minutes. It holds no code and
+# no secrets in the open; pull requests cannot trigger it.
+name: Publish younggroupmtg.com
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish even if this commit is already live"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # only for the keep-alive commit below
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - name: Fetch the site (read-only key; nothing from it is run)
+        id: src
+        env:
+          KEY: ${{ secrets.SITE_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && printf '%s\n' "$KEY" > ~/.ssh/site && chmod 600 ~/.ssh/site
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/site -o IdentitiesOnly=yes" \
+            git clone -q --depth 1 git@github.com:DYoung-cpu/young-group-site.git site
+          rm -f ~/.ssh/site
+          echo "sha=$(git -C site rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          rm -rf site/.git
+
+      - name: Already live?
+        id: check
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          SHA: ${{ steps.src.outputs.sha }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          last=$(curl -sf -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_ORG_ID&target=production&limit=1" \
+            | python3 -c "import json,sys;d=json.load(sys.stdin)['deployments'];print((d[0].get('meta') or {}).get('siteSha','') if d else '')")
+          echo "live=$last head=$SHA"
+          if [ "$last" = "$SHA" ] && [ "$FORCE" != "true" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Publish (Vercel builds it on its own machines)
+        if: steps.check.outputs.skip != 'true'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: npx --yes vercel@51.6.1 deploy --prod --yes --cwd site --token "$VERCEL_TOKEN" --meta siteSha="$SHA"
+
+      # GitHub switches off scheduled workflows in a public repo after 60 days
+      # with no commits. One empty commit a month keeps the poll alive.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        uses: actions/checkout@v4
+        with:
+          path: self
+      - if: github.event_name == 'schedule'
+        working-directory: self
+        run: |
+          age=$(( ($(date +%s) - $(git log -1 --format=%ct)) / 86400 ))
+          if [ "$age" -gt 30 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -q --allow-empty -m "keep-alive" && git push -q
+          fi
